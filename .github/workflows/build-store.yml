@@ -292,6 +292,8 @@ jobs:
           }
           EOF
 
+      - name: Generate store screen
+        run: |
           cat > app/src/main/java/com/scical/store/MainActivity.java <<'EOF'
           package com.scical.store;
 
