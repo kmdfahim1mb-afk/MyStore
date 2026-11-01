@@ -1,0 +1,688 @@
+name: Build Store APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Create signing key (first run only)
+        run: |
+          if [ ! -f store.jks ]; then
+            keytool -genkeypair -keystore store.jks -storepass scical123 -keypass scical123 -alias key -keyalg RSA -keysize 2048 -validity 36500 -dname "CN=MyStore"
+            git config user.name "github-actions"
+            git config user.email "actions@github.com"
+            git add store.jks
+            git commit -m "Add signing key"
+            git push
+          fi
+
+      - name: Generate Android project
+        run: |
+          mkdir -p app/src/main/java/com/scical/store
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "MyStore"
+          include ':app'
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.nonTransitiveRClass=true
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+          android {
+              namespace 'com.scical.store'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'com.scical.store'
+                  minSdk 26
+                  targetSdk 34
+                  versionCode Integer.parseInt((project.findProperty('vCode') ?: '1').toString())
+                  versionName '1.0'
+              }
+              signingConfigs {
+                  fixed {
+                      storeFile file('../store.jks')
+                      storePassword 'scical123'
+                      keyAlias 'key'
+                      keyPassword 'scical123'
+                  }
+              }
+              buildTypes {
+                  debug {
+                      signingConfig signingConfigs.fixed
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+              <application
+                  android:label="আমার অ্যাপ স্টোর"
+                  android:icon="@android:drawable/sym_def_app_icon"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".UpdateJob"
+                      android:permission="android.permission.BIND_JOB_SERVICE"
+                      android:exported="false" />
+                  <receiver android:name=".InstallReceiver" android:exported="false" />
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/scical/store/Catalog.java <<'EOF'
+          package com.scical.store;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.content.pm.PackageInfo;
+          import android.content.pm.PackageManager;
+          import java.io.BufferedReader;
+          import java.io.InputStreamReader;
+          import java.net.HttpURLConnection;
+          import java.util.ArrayList;
+          import java.util.List;
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+
+          public class Catalog {
+              static final String URL = "__CATALOG_URL__";
+
+              static class App {
+                  String id, name, desc, versionName, apk, icon = "";
+                  long versionCode;
+              }
+
+              static List<App> fetch() throws Exception {
+                  String u = URL + (URL.contains("?") ? "&" : "?") + "t=" + System.currentTimeMillis();
+                  HttpURLConnection c = (HttpURLConnection) new java.net.URL(u).openConnection();
+                  c.setConnectTimeout(15000);
+                  c.setReadTimeout(20000);
+                  StringBuilder sb = new StringBuilder();
+                  try (BufferedReader r = new BufferedReader(new InputStreamReader(c.getInputStream(), "UTF-8"))) {
+                      String line;
+                      while ((line = r.readLine()) != null) sb.append(line).append('\n');
+                  }
+                  JSONArray arr = new JSONArray(sb.toString());
+                  List<App> out = new ArrayList<>();
+                  for (int i = 0; i < arr.length(); i++) {
+                      JSONObject o = arr.getJSONObject(i);
+                      App a = new App();
+                      a.id = o.getString("id");
+                      a.name = o.optString("name", a.id);
+                      a.desc = o.optString("desc", "");
+                      a.versionName = o.optString("versionName", "");
+                      a.versionCode = o.getLong("versionCode");
+                      a.apk = o.getString("apk");
+                  a.icon = o.optString("icon", "");
+                      out.add(a);
+                  }
+                  return out;
+              }
+
+              @SuppressWarnings("deprecation")
+              static long installedCode(Context c, String pkg) {
+                  try {
+                      PackageInfo pi = c.getPackageManager().getPackageInfo(pkg, 0);
+                      return android.os.Build.VERSION.SDK_INT >= 28 ? pi.getLongVersionCode() : pi.versionCode;
+                  } catch (PackageManager.NameNotFoundException e) {
+                      return -1;
+                  }
+              }
+
+              static void notifyUpdates(Context c, List<App> apps) {
+                  int n = 0;
+                  StringBuilder sig = new StringBuilder();
+                  StringBuilder names = new StringBuilder();
+                  for (App a : apps) {
+                      long ic = installedCode(c, a.id);
+                      if (ic >= 0 && ic < a.versionCode) {
+                          n++;
+                          sig.append(a.id).append(':').append(a.versionCode).append(';');
+                          if (names.length() > 0) names.append(", ");
+                          names.append(a.name);
+                      }
+                  }
+                  SharedPreferences sp = c.getSharedPreferences("store", 0);
+                  if (n == 0) {
+                      sp.edit().putString("sig", "").apply();
+                      return;
+                  }
+                  if (sig.toString().equals(sp.getString("sig", ""))) return;
+
+                  NotificationManager nm = (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
+                  nm.createNotificationChannel(new NotificationChannel("updates", "অ্যাপ আপডেট", NotificationManager.IMPORTANCE_DEFAULT));
+                  PendingIntent pi = PendingIntent.getActivity(c, 0, new Intent(c, MainActivity.class),
+                          PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+                  Notification nf = new Notification.Builder(c, "updates")
+                          .setSmallIcon(android.R.drawable.stat_sys_download_done)
+                          .setContentTitle(n + " টি অ্যাপের আপডেট আছে")
+                          .setContentText(names.toString() + " — আপডেট করতে ট্যাপ করুন")
+                          .setContentIntent(pi)
+                          .setAutoCancel(true)
+                          .build();
+                  nm.notify(1, nf);
+                  sp.edit().putString("sig", sig.toString()).apply();
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/scical/store/UpdateJob.java <<'EOF'
+          package com.scical.store;
+
+          import android.app.job.JobInfo;
+          import android.app.job.JobParameters;
+          import android.app.job.JobScheduler;
+          import android.app.job.JobService;
+          import android.content.ComponentName;
+          import android.content.Context;
+
+          public class UpdateJob extends JobService {
+              @Override
+              public boolean onStartJob(JobParameters p) {
+                  new Thread(() -> {
+                      try {
+                          Catalog.notifyUpdates(this, Catalog.fetch());
+                      } catch (Exception e) {
+                      }
+                      jobFinished(p, false);
+                  }).start();
+                  return true;
+              }
+
+              @Override
+              public boolean onStopJob(JobParameters p) {
+                  return true;
+              }
+
+              static void schedule(Context c) {
+                  JobScheduler js = (JobScheduler) c.getSystemService(Context.JOB_SCHEDULER_SERVICE);
+                  if (js.getPendingJob(1001) != null) return;
+                  JobInfo info = new JobInfo.Builder(1001, new ComponentName(c, UpdateJob.class))
+                          .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
+                          .setPeriodic(15 * 60 * 1000L)
+                          .setPersisted(true)
+                          .build();
+                  js.schedule(info);
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/scical/store/InstallReceiver.java <<'EOF'
+          package com.scical.store;
+
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.pm.PackageInstaller;
+          import android.widget.Toast;
+
+          public class InstallReceiver extends BroadcastReceiver {
+              @SuppressWarnings("deprecation")
+              @Override
+              public void onReceive(Context c, Intent i) {
+                  int st = i.getIntExtra(PackageInstaller.EXTRA_STATUS, -1);
+                  if (st == PackageInstaller.STATUS_PENDING_USER_ACTION) {
+                      Intent a = i.getParcelableExtra(Intent.EXTRA_INTENT);
+                      if (a != null) {
+                          a.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                          c.startActivity(a);
+                      }
+                  } else if (st != PackageInstaller.STATUS_SUCCESS) {
+                      Toast.makeText(c, "ইনস্টল হয়নি: " + i.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE), Toast.LENGTH_LONG).show();
+                  }
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/scical/store/MainActivity.java <<'EOF'
+          package com.scical.store;
+
+          import android.app.Activity;
+          import android.app.PendingIntent;
+          import android.content.Intent;
+          import android.content.pm.PackageInstaller;
+          import android.graphics.Bitmap;
+          import android.graphics.BitmapFactory;
+          import android.graphics.Color;
+          import android.graphics.Typeface;
+          import android.graphics.drawable.BitmapDrawable;
+          import android.graphics.drawable.GradientDrawable;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.provider.Settings;
+          import android.text.Editable;
+          import android.text.TextWatcher;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.widget.Button;
+          import android.widget.EditText;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+          import android.widget.Toast;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.net.HttpURLConnection;
+          import java.util.ArrayList;
+          import java.util.List;
+
+          public class MainActivity extends Activity {
+              static final int BG = 0xFF0B0B1F;
+              static final int CARD = 0xFF1A1B3A;
+              static final int SUB = 0xFFA0A3C4;
+              static final int C1 = 0xFF7C3AED;
+              static final int C2 = 0xFF2563EB;
+              static final int MATCH = ViewGroup.LayoutParams.MATCH_PARENT;
+              static final int WRAP = ViewGroup.LayoutParams.WRAP_CONTENT;
+
+              LinearLayout list;
+              TextView banner;
+              EditText search;
+              List<Catalog.App> all = new ArrayList<>();
+
+              int dp(int v) {
+                  return (int) (v * getResources().getDisplayMetrics().density);
+              }
+
+              GradientDrawable solid(int color, int radiusDp) {
+                  GradientDrawable g = new GradientDrawable();
+                  g.setColor(color);
+                  g.setCornerRadius(dp(radiusDp));
+                  return g;
+              }
+
+              GradientDrawable grad(int radiusDp) {
+                  GradientDrawable g = new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT, new int[]{C1, C2});
+                  g.setCornerRadius(dp(radiusDp));
+                  return g;
+              }
+
+              TextView text(String s, int sp, int color, boolean bold) {
+                  TextView t = new TextView(this);
+                  t.setText(s);
+                  t.setTextSize(sp);
+                  t.setTextColor(color);
+                  if (bold) t.setTypeface(null, Typeface.BOLD);
+                  return t;
+              }
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  final Thread.UncaughtExceptionHandler oldH = Thread.getDefaultUncaughtExceptionHandler();
+                  Thread.setDefaultUncaughtExceptionHandler((th, ex) -> {
+                      try {
+                          java.io.StringWriter sw = new java.io.StringWriter();
+                          ex.printStackTrace(new java.io.PrintWriter(sw));
+                          String tr = sw.toString();
+                          getSharedPreferences("crash", 0).edit().putString("trace", tr.length() > 3000 ? tr.substring(0, 3000) : tr).commit();
+                      } catch (Throwable ignored) {
+                      }
+                      if (oldH != null) oldH.uncaughtException(th, ex);
+                  });
+                  if (showCrash()) return;
+
+                  try {
+                      getWindow().setStatusBarColor(BG);
+                      getWindow().setNavigationBarColor(BG);
+                  } catch (Throwable ignored) {
+                  }
+
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setBackgroundColor(BG);
+                  root.setPadding(dp(16), dp(8), dp(16), 0);
+
+                  LinearLayout head = new LinearLayout(this);
+                  head.setOrientation(LinearLayout.HORIZONTAL);
+                  head.setGravity(Gravity.CENTER_VERTICAL);
+                  TextView title = text("আমার অ্যাপ স্টোর", 22, Color.WHITE, true);
+                  head.addView(title, new LinearLayout.LayoutParams(0, WRAP, 1f));
+                  TextView refresh = text("↻", 26, Color.WHITE, true);
+                  refresh.setPadding(dp(12), 0, dp(4), 0);
+                  refresh.setOnClickListener(v -> load());
+                  head.addView(refresh);
+                  root.addView(head);
+
+                  search = new EditText(this);
+                  search.setHint("অ্যাপ খুঁজুন...");
+                  search.setHintTextColor(SUB);
+                  search.setTextColor(Color.WHITE);
+                  search.setSingleLine(true);
+                  search.setTextSize(15);
+                  search.setBackground(solid(CARD, 24));
+                  search.setPadding(dp(18), dp(12), dp(18), dp(12));
+                  LinearLayout.LayoutParams sLp = new LinearLayout.LayoutParams(MATCH, WRAP);
+                  sLp.setMargins(0, dp(12), 0, dp(12));
+                  root.addView(search, sLp);
+                  search.addTextChangedListener(new TextWatcher() {
+                      @Override
+                      public void beforeTextChanged(CharSequence s, int a, int c, int d) {
+                      }
+
+                      @Override
+                      public void onTextChanged(CharSequence s, int a, int c, int d) {
+                          render();
+                      }
+
+                      @Override
+                      public void afterTextChanged(Editable e) {
+                      }
+                  });
+
+                  LinearLayout hero = new LinearLayout(this);
+                  hero.setOrientation(LinearLayout.VERTICAL);
+                  hero.setBackground(grad(22));
+                  hero.setPadding(dp(20), dp(18), dp(20), dp(18));
+                  hero.addView(text("সব অ্যাপ এক জায়গায়", 18, Color.WHITE, true));
+                  banner = text("লোড হচ্ছে...", 14, 0xFFE0E7FF, false);
+                  banner.setPadding(0, dp(4), 0, 0);
+                  hero.addView(banner);
+                  LinearLayout.LayoutParams hLp = new LinearLayout.LayoutParams(MATCH, WRAP);
+                  hLp.setMargins(0, 0, 0, dp(14));
+                  root.addView(hero, hLp);
+
+                  root.addView(text("আপনার অ্যাপ", 16, Color.WHITE, true));
+
+                  ScrollView sv = new ScrollView(this);
+                  list = new LinearLayout(this);
+                  list.setOrientation(LinearLayout.VERTICAL);
+                  list.setPadding(0, dp(10), 0, dp(16));
+                  sv.addView(list);
+                  root.addView(sv, new LinearLayout.LayoutParams(MATCH, 0, 1f));
+                  setContentView(root);
+
+                  if (Build.VERSION.SDK_INT >= 33
+                          && checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                      requestPermissions(new String[]{android.Manifest.permission.POST_NOTIFICATIONS}, 1);
+                  }
+                  try {
+                      UpdateJob.schedule(this);
+                  } catch (Throwable e) {
+                  }
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  load();
+              }
+
+              boolean showCrash() {
+                  String s = getSharedPreferences("crash", 0).getString("trace", null);
+                  if (s == null) return false;
+                  LinearLayout box = new LinearLayout(this);
+                  box.setOrientation(LinearLayout.VERTICAL);
+                  box.setPadding(dp(16), dp(40), dp(16), dp(16));
+                  Button clear = new Button(this);
+                  clear.setText("মুছে আবার চেষ্টা করুন");
+                  clear.setOnClickListener(v -> {
+                      getSharedPreferences("crash", 0).edit().clear().commit();
+                      recreate();
+                  });
+                  TextView tv = new TextView(this);
+                  tv.setText("ক্র্যাশের কারণ (স্ক্রিনশট পাঠান):\n\n" + s);
+                  tv.setTextIsSelectable(true);
+                  tv.setTextSize(12);
+                  ScrollView sv = new ScrollView(this);
+                  sv.addView(tv);
+                  box.addView(clear);
+                  box.addView(sv, new LinearLayout.LayoutParams(MATCH, 0, 1f));
+                  setContentView(box);
+                  return true;
+              }
+
+              void load() {
+                  if (banner == null) return;
+                  banner.setText("লোড হচ্ছে...");
+                  new Thread(() -> {
+                      try {
+                          List<Catalog.App> apps = Catalog.fetch();
+                          runOnUiThread(() -> {
+                              all = apps;
+                              render();
+                          });
+                      } catch (Exception e) {
+                          runOnUiThread(() -> banner.setText("লোড করা যায়নি। ইন্টারনেট দেখে রিফ্রেশ দিন।"));
+                      }
+                  }).start();
+              }
+
+              void render() {
+                  list.removeAllViews();
+                  String q = search.getText().toString().trim().toLowerCase();
+                  int upd = 0;
+                  for (Catalog.App a : all) {
+                      long ic = Catalog.installedCode(this, a.id);
+                      if (ic >= 0 && ic < a.versionCode) upd++;
+                  }
+                  banner.setText(upd > 0 ? upd + " টি অ্যাপের আপডেট আছে" : "সব অ্যাপ আপ-টু-ডেট");
+                  for (Catalog.App a : all) {
+                      if (q.length() > 0 && !(a.name.toLowerCase().contains(q) || a.desc.toLowerCase().contains(q))) continue;
+                      list.addView(card(a));
+                  }
+                  if (list.getChildCount() == 0) {
+                      TextView e = text("কোনো অ্যাপ পাওয়া যায়নি", 14, SUB, false);
+                      e.setPadding(0, dp(24), 0, 0);
+                      list.addView(e);
+                  }
+              }
+
+              View card(Catalog.App a) {
+                  long ic = Catalog.installedCode(this, a.id);
+                  boolean isNew = ic < 0;
+                  boolean hasUpdate = ic >= 0 && ic < a.versionCode;
+
+                  LinearLayout row = new LinearLayout(this);
+                  row.setOrientation(LinearLayout.HORIZONTAL);
+                  row.setGravity(Gravity.CENTER_VERTICAL);
+                  row.setBackground(solid(CARD, 18));
+                  row.setPadding(dp(12), dp(12), dp(12), dp(12));
+
+                  TextView icon = new TextView(this);
+                  icon.setGravity(Gravity.CENTER);
+                  icon.setTextColor(Color.WHITE);
+                  icon.setTextSize(22);
+                  icon.setTypeface(null, Typeface.BOLD);
+                  icon.setBackground(grad(14));
+                  icon.setText(a.name.length() > 0 ? a.name.substring(0, 1).toUpperCase() : "?");
+                  row.addView(icon, new LinearLayout.LayoutParams(dp(56), dp(56)));
+                  if (a.icon.length() > 0) loadIcon(a.icon, icon);
+
+                  LinearLayout mid = new LinearLayout(this);
+                  mid.setOrientation(LinearLayout.VERTICAL);
+                  mid.setPadding(dp(12), 0, dp(8), 0);
+                  mid.addView(text(a.name, 16, Color.WHITE, true));
+                  TextView desc = text(a.desc, 12, SUB, false);
+                  desc.setMaxLines(2);
+                  mid.addView(desc);
+                  String vt = "ভার্সন " + a.versionName + (hasUpdate ? " • নতুন" : isNew ? "" : " • ইনস্টল করা আছে");
+                  mid.addView(text(vt, 11, hasUpdate ? 0xFFFBBF24 : SUB, false));
+                  row.addView(mid, new LinearLayout.LayoutParams(0, WRAP, 1f));
+
+                  TextView btn = text(isNew ? "ইনস্টল" : hasUpdate ? "আপডেট" : "খুলুন", 13, Color.WHITE, true);
+                  btn.setGravity(Gravity.CENTER);
+                  btn.setPadding(dp(16), dp(9), dp(16), dp(9));
+                  btn.setBackground(hasUpdate ? solid(0xFFF59E0B, 20) : isNew ? grad(20) : solid(0xFF2A2C55, 20));
+                  final boolean open = !isNew && !hasUpdate;
+                  btn.setOnClickListener(v -> {
+                      if (open) {
+                          Intent li = getPackageManager().getLaunchIntentForPackage(a.id);
+                          if (li != null) startActivity(li);
+                      } else {
+                          install(a, btn);
+                      }
+                  });
+                  row.addView(btn);
+
+                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(MATCH, WRAP);
+                  lp.setMargins(0, 0, 0, dp(10));
+                  row.setLayoutParams(lp);
+                  return row;
+              }
+
+              void loadIcon(String url, TextView target) {
+                  new Thread(() -> {
+                      try {
+                          HttpURLConnection c = (HttpURLConnection) new java.net.URL(url).openConnection();
+                          c.setConnectTimeout(10000);
+                          c.setReadTimeout(15000);
+                          try (InputStream in = c.getInputStream()) {
+                              Bitmap bm = BitmapFactory.decodeStream(in);
+                              if (bm != null) {
+                                  runOnUiThread(() -> {
+                                      target.setText("");
+                                      target.setBackground(new BitmapDrawable(getResources(), bm));
+                                  });
+                              }
+                          }
+                      } catch (Exception e) {
+                      }
+                  }).start();
+              }
+
+              void install(Catalog.App a, TextView btn) {
+                  if (!getPackageManager().canRequestPackageInstalls()) {
+                      Toast.makeText(this, "এই স্টোরকে অ্যাপ ইনস্টলের অনুমতি দিন, তারপর আবার চাপুন", Toast.LENGTH_LONG).show();
+                      startActivity(new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:" + getPackageName())));
+                      return;
+                  }
+                  btn.setEnabled(false);
+                  new Thread(() -> {
+                      PackageInstaller pi = getPackageManager().getPackageInstaller();
+                      int sid = -1;
+                      try {
+                          PackageInstaller.SessionParams sp = new PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL);
+                          sp.setAppPackageName(a.id);
+                          if (Build.VERSION.SDK_INT >= 31) {
+                              sp.setRequireUserAction(PackageInstaller.SessionParams.USER_ACTION_NOT_REQUIRED);
+                          }
+                          sid = pi.createSession(sp);
+                          PackageInstaller.Session s = pi.openSession(sid);
+                          HttpURLConnection c = (HttpURLConnection) new java.net.URL(a.apk).openConnection();
+                          c.setInstanceFollowRedirects(true);
+                          c.setConnectTimeout(15000);
+                          c.setReadTimeout(30000);
+                          long total = c.getContentLengthLong();
+                          try (InputStream in = c.getInputStream(); OutputStream out = s.openWrite("apk", 0, total)) {
+                              byte[] buf = new byte[65536];
+                              long done = 0;
+                              int last = -1;
+                              int n;
+                              while ((n = in.read(buf)) > 0) {
+                                  out.write(buf, 0, n);
+                                  done += n;
+                                  if (total > 0) {
+                                      int pct = (int) (done * 100 / total);
+                                      if (pct != last) {
+                                          last = pct;
+                                          final int p = pct;
+                                          runOnUiThread(() -> btn.setText(p + "%"));
+                                      }
+                                  }
+                              }
+                              s.fsync(out);
+                          }
+                          runOnUiThread(() -> btn.setText("ইনস্টল হচ্ছে..."));
+                          Intent i = new Intent(this, InstallReceiver.class);
+                          int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+                          if (Build.VERSION.SDK_INT >= 31) flags |= PendingIntent.FLAG_MUTABLE;
+                          PendingIntent pend = PendingIntent.getBroadcast(this, sid, i, flags);
+                          s.commit(pend.getIntentSender());
+                          s.close();
+                      } catch (Exception e) {
+                          try {
+                              if (sid != -1) pi.abandonSession(sid);
+                          } catch (Exception ignored) {
+                          }
+                          runOnUiThread(() -> {
+                              btn.setEnabled(true);
+                              btn.setText("আবার চেষ্টা");
+                              Toast.makeText(this, "ডাউনলোড ব্যর্থ। লিংক ও ইন্টারনেট দেখুন।", Toast.LENGTH_LONG).show();
+                          });
+                      }
+                  }).start();
+              }
+          }
+          EOF
+
+          if [ -f icon.png ]; then
+            mkdir -p app/src/main/res/mipmap-xxxhdpi
+            cp icon.png app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
+            sed -i 's#@android:drawable/sym_def_app_icon#@mipmap/ic_launcher#' app/src/main/AndroidManifest.xml
+          fi
+
+          sed -i "s#__CATALOG_URL__#https://raw.githubusercontent.com/${{ github.repository }}/main/apps.json#" app/src/main/java/com/scical/store/Catalog.java
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: Build APK
+        run: gradle assembleDebug --no-daemon -PvCode=${{ github.run_number }}
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: MyStore-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
