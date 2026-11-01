@@ -1,0 +1,10 @@
+[
+  {
+    "id": "com.scical.app",
+    "name": "Sci Cal",
+    "desc": "বাংলা সায়েন্টিফিক ক্যালকুলেটর",
+    "versionCode": 1,
+    "versionName": "1.0",
+    "apk": "https://github.com/kmdfahim1mb-afk/Sci-cal/releases/download/v1/app-debug.apk"
+  }
+]
