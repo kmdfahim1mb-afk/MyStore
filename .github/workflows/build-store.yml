@@ -104,7 +104,7 @@ jobs:
               <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
               <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
               <application
-                  android:label="App Hub"
+                  android:label="আমার অ্যাপ স্টোর"
                   android:icon="@android:drawable/sym_def_app_icon"
                   android:theme="@android:style/Theme.Material.NoActionBar">
                   <activity android:name=".MainActivity" android:exported="true">
@@ -398,7 +398,7 @@ jobs:
                   LinearLayout head = new LinearLayout(this);
                   head.setOrientation(LinearLayout.HORIZONTAL);
                   head.setGravity(Gravity.CENTER_VERTICAL);
-                  TextView title = text("App Hub", 22, Color.WHITE, true);
+                  TextView title = text("আমার অ্যাপ স্টোর", 22, Color.WHITE, true);
                   head.addView(title, new LinearLayout.LayoutParams(0, WRAP, 1f));
                   TextView refresh = text("↻", 26, Color.WHITE, true);
                   refresh.setPadding(dp(12), 0, dp(4), 0);
@@ -625,6 +625,8 @@ jobs:
                           c.setInstanceFollowRedirects(true);
                           c.setConnectTimeout(15000);
                           c.setReadTimeout(30000);
+                          int code = c.getResponseCode();
+                          if (code != 200) throw new Exception("সার্ভার উত্তর " + code + " (ফাইল পাওয়া যায়নি বা লিংক ভুল)");
                           long total = c.getContentLengthLong();
                           try (InputStream in = c.getInputStream(); OutputStream out = s.openWrite("apk", 0, total)) {
                               byte[] buf = new byte[65536];
@@ -660,7 +662,9 @@ jobs:
                           runOnUiThread(() -> {
                               btn.setEnabled(true);
                               btn.setText("আবার চেষ্টা");
-                              Toast.makeText(this, "ডাউনলোড ব্যর্থ। লিংক ও ইন্টারনেট দেখুন।", Toast.LENGTH_LONG).show();
+                              String msg = e.getMessage() != null ? e.getMessage() : e.toString();
+                              banner.setText("ডাউনলোড ব্যর্থ: " + msg);
+                              Toast.makeText(this, "ডাউনলোড ব্যর্থ: " + msg, Toast.LENGTH_LONG).show();
                           });
                       }
                   }).start();
