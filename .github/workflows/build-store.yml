@@ -180,7 +180,7 @@ jobs:
               static long installedCode(Context c, String pkg) {
                   try {
                       PackageInfo pi = c.getPackageManager().getPackageInfo(pkg, 0);
-                      return pi.getLongVersionCode();
+                      return android.os.Build.VERSION.SDK_INT >= 28 ? pi.getLongVersionCode() : pi.versionCode;
                   } catch (PackageManager.NameNotFoundException e) {
                       return -1;
                   }
@@ -325,6 +325,18 @@ jobs:
               @Override
               protected void onCreate(Bundle b) {
                   super.onCreate(b);
+                  final Thread.UncaughtExceptionHandler oldH = Thread.getDefaultUncaughtExceptionHandler();
+                  Thread.setDefaultUncaughtExceptionHandler((th, ex) -> {
+                      try {
+                          java.io.StringWriter sw = new java.io.StringWriter();
+                          ex.printStackTrace(new java.io.PrintWriter(sw));
+                          String tr = sw.toString();
+                          getSharedPreferences("crash", 0).edit().putString("trace", tr.length() > 3000 ? tr.substring(0, 3000) : tr).commit();
+                      } catch (Throwable ignored) {
+                      }
+                      if (oldH != null) oldH.uncaughtException(th, ex);
+                  });
+                  if (showCrash()) return;
                   LinearLayout root = new LinearLayout(this);
                   root.setOrientation(LinearLayout.VERTICAL);
                   root.setPadding(dp(16), dp(40), dp(16), dp(8));
@@ -351,7 +363,10 @@ jobs:
                           && checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
                       requestPermissions(new String[]{android.Manifest.permission.POST_NOTIFICATIONS}, 1);
                   }
-                  UpdateJob.schedule(this);
+                  try {
+                      UpdateJob.schedule(this);
+                  } catch (Throwable e) {
+                  }
               }
 
               @Override
@@ -360,7 +375,31 @@ jobs:
                   load();
               }
 
+              boolean showCrash() {
+                  String s = getSharedPreferences("crash", 0).getString("trace", null);
+                  if (s == null) return false;
+                  LinearLayout box = new LinearLayout(this);
+                  box.setOrientation(LinearLayout.VERTICAL);
+                  box.setPadding(dp(16), dp(40), dp(16), dp(16));
+                  Button clear = new Button(this);
+                  clear.setText("মুছে আবার চেষ্টা করুন");
+                  clear.setOnClickListener(v -> {
+                      getSharedPreferences("crash", 0).edit().clear().commit();
+                      recreate();
+                  });
+                  TextView tv = new TextView(this);
+                  tv.setText("ক্র্যাশের কারণ (স্ক্রিনশট পাঠান):\n\n" + s);
+                  tv.setTextIsSelectable(true);
+                  tv.setTextSize(12);
+                  ScrollView sv = new ScrollView(this);
+                  sv.addView(tv);
+                  box.addView(clear);
+                  box.addView(sv, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+                  setContentView(box);
+                  return true;
+              }
               void load() {
+              if (banner == null) return;
                   banner.setText("লোড হচ্ছে...");
                   new Thread(() -> {
                       try {
